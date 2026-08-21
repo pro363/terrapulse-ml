@@ -1,11 +1,10 @@
- {                                                                                                                                                               
-      "framework": null,                                                                                                                                            
-      "buildCommand": "echo 'ready'",                                                                                                                               
-      "outputDirectory": ".",                                                                                                                                       
-      "rewrites": [                                                                                                                                                 
+{                                                                                                                                                               
+      "redirects": [                                                                                                                                                
         {                                                                                                                                                           
           "source": "/(.*)",                                                                                                                                        
-          "destination": "https://terrapulse-ml.onrender.com/$1"                                                                                                    
+          "destination": "https://terrapulse-ml.onrender.com/$1",                                                                                                   
+          "permanent": false                                                                                                                                        
         }                                                                                                                                                           
       ]                                                                                                                                                             
-    }          
+    }                                                                                                                                                               
+         
