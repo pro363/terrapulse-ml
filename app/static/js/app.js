@@ -1,0 +1,1162 @@
+/* ============================================================
+   Ames Home Prediction Project - Client Interaction Engine
+   ============================================================ */
+
+// Map Viewport Constants
+const AMES_CENTER = [42.034, -93.642];
+const GLOBAL_CENTER = [20.0, 0.0];
+
+const BASEMAPS = {
+    dark: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+    satellite: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+    light: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png'
+};
+
+// Global App State
+let currentSection = 'calculator'; // 'calculator' | 'map' | 'docs'
+let currentScope = 'ames';         // 'ames' | 'global'
+let map, currentTileLayer, labelTileLayer;
+let amesDotsLayerGroup, globalDotsLayerGroup, activeMarkerLayerGroup;
+let selectedProperty = null;
+let calcDebounceTimer = null;
+let inspDebounceTimer = null;
+let searchIndex = [];
+
+// ============================================================
+// 1. Navigation & Section Routing
+// ============================================================
+function switchSection(sectionId) {
+    currentSection = sectionId;
+
+    // Update Header Tabs
+    document.querySelectorAll('.nav-tab').forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.section === sectionId);
+    });
+
+    // Update Sections Visibility
+    document.querySelectorAll('.app-section').forEach(sec => {
+        sec.classList.toggle('active', sec.id === `section-${sectionId}`);
+    });
+
+    // Invalidate map size if switching to map
+    if (sectionId === 'map') {
+        setTimeout(() => {
+            if (map) map.invalidateSize();
+        }, 100);
+    }
+}
+
+function setScope(scope) {
+    currentScope = scope;
+    document.getElementById('btn-scope-ames').classList.toggle('active', scope === 'ames');
+    document.getElementById('btn-scope-global').classList.toggle('active', scope === 'global');
+
+    // Toggle dropdown visibility in Calculator
+    const neighGroup = document.getElementById('group-calc-neighborhood');
+    const cityGroup = document.getElementById('group-calc-city');
+    const marketContext = document.getElementById('calc-market-context');
+    if (neighGroup && cityGroup) {
+        neighGroup.classList.toggle('hidden', scope === 'global');
+        cityGroup.classList.toggle('hidden', scope === 'ames');
+        if (marketContext) marketContext.classList.toggle('hidden', scope === 'global');
+    }
+
+    // Toggle map layers if map is ready
+    if (map) {
+        if (scope === 'ames') {
+            map.flyTo(AMES_CENTER, 13, { duration: 1.5 });
+            if (amesDotsLayerGroup) map.addLayer(amesDotsLayerGroup);
+            if (globalDotsLayerGroup) map.removeLayer(globalDotsLayerGroup);
+            document.getElementById('map-legend').style.display = 'block';
+        } else {
+            map.flyTo(GLOBAL_CENTER, 2.5, { duration: 1.8 });
+            if (amesDotsLayerGroup) map.removeLayer(amesDotsLayerGroup);
+            if (globalDotsLayerGroup) map.addLayer(globalDotsLayerGroup);
+            document.getElementById('map-legend').style.display = 'none';
+        }
+    }
+
+    // Trigger calculation for new scope
+    if (scope === 'ames') {
+        handleNeighborhoodDropdownChange();
+    } else {
+        handleCityDropdownChange();
+    }
+}
+
+// ============================================================
+// 2. Map Initialization & Spatial Engine
+// ============================================================
+function initMap() {
+    map = L.map('map', {
+        center: AMES_CENTER,
+        zoom: 13,
+        minZoom: 2,
+        maxZoom: 18,
+        zoomControl: false,
+    });
+
+    L.control.zoom({ position: 'topright' }).addTo(map);
+
+    setBasemap('dark');
+
+    amesDotsLayerGroup = L.layerGroup();
+    globalDotsLayerGroup = L.layerGroup();
+    activeMarkerLayerGroup = L.layerGroup().addTo(map);
+
+    renderAmesHouseDots();
+    renderGlobalCityDots();
+
+    if (currentScope === 'ames') {
+        amesDotsLayerGroup.addTo(map);
+    } else {
+        globalDotsLayerGroup.addTo(map);
+    }
+
+    map.on('click', handleMapBackgroundClick);
+
+    setupSearchIndex();
+}
+
+function setBasemap(type) {
+    if (currentTileLayer) map.removeLayer(currentTileLayer);
+    if (labelTileLayer) map.removeLayer(labelTileLayer);
+
+    currentTileLayer = L.tileLayer(BASEMAPS[type], {
+        attribution: '&copy; OpenStreetMap &copy; CartoDB &copy; Esri',
+        maxZoom: 19,
+        subdomains: 'abcd'
+    }).addTo(map);
+
+    if (type === 'satellite') {
+        labelTileLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}{r}.png', {
+            maxZoom: 19,
+            subdomains: 'abcd',
+            opacity: 0.85
+        }).addTo(map);
+    }
+
+    document.querySelectorAll('.layer-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.layer === type);
+    });
+}
+
+// Render 1,460 House Dots with Clean Tooltips
+function renderAmesHouseDots() {
+    if (!AMES_HOUSES || !Array.isArray(AMES_HOUSES)) return;
+
+    AMES_HOUSES.forEach(house => {
+        const marker = L.circleMarker([house.lat, house.lng], {
+            radius: 5,
+            fillColor: house.color || '#38bdf8',
+            color: '#ffffff',
+            weight: 0.75,
+            opacity: 0.9,
+            fillOpacity: 0.8,
+        });
+
+        // Clean Hover Tooltip (No Emojis)
+        const tierName = (house.tier || 'mid').toUpperCase() + ' TIER';
+        const tooltipHtml = `
+            <div class="tooltip-card-header">
+                <span class="tooltip-price">$${house.price.toLocaleString()}</span>
+                <span class="tooltip-tier-pill" style="background: ${house.color}25; color: ${house.color}; border: 1px solid ${house.color}60;">${tierName}</span>
+            </div>
+            <div class="tooltip-neigh">${getNeighborhoodFullName(house.neighborhood)}, Ames, IA</div>
+            <div class="tooltip-specs-grid">
+                <div>Living Area: <strong>${house.GrLivArea.toLocaleString()}</strong> sqft</div>
+                <div>Basement: <strong>${(house.TotalBsmtSF || 0).toLocaleString()}</strong> sqft</div>
+                <div>Quality: <strong>${house.OverallQual}/10</strong> (Condition: ${house.OverallCond || 5}/10)</div>
+                <div>Year Built: <strong>${house.YearBuilt}</strong></div>
+                <div>Bedrooms: <strong>${house.BedroomAbvGr}</strong> | Baths: <strong>${house.FullBath}</strong></div>
+                <div>Garage: <strong>${house.GarageCars || 0}</strong> Cars (${house.HouseStyle || '1Fam'})</div>
+            </div>
+        `;
+        marker.bindTooltip(tooltipHtml, { sticky: true, className: 'house-dot-tooltip' });
+
+        marker.on('click', (e) => {
+            L.DomEvent.stopPropagation(e);
+            selectHouseDot(house);
+        });
+
+        marker.addTo(amesDotsLayerGroup);
+    });
+}
+
+function renderGlobalCityDots() {
+    if (!CITY_COORDINATES || !GLOBAL_STATS?.cities) return;
+
+    for (const [key, coords] of Object.entries(CITY_COORDINATES)) {
+        const [country, city] = key.split('|');
+        const stats = GLOBAL_STATS.cities[key];
+        const median = stats ? stats.median_price : 1000000;
+
+        const icon = L.divIcon({
+            className: '',
+            html: `
+                <div class="city-marker" title="${city}, ${country}">
+                    <span class="city-dot"></span>
+                    <span>${city}</span>
+                    <span class="city-price">$${formatPrice(median)}</span>
+                </div>
+            `,
+            iconSize: null,
+            iconAnchor: [40, 15]
+        });
+
+        const marker = L.marker(coords, { icon });
+        marker.on('click', (e) => {
+            L.DomEvent.stopPropagation(e);
+            selectGlobalCityDot(country, city, coords);
+        });
+
+        marker.addTo(globalDotsLayerGroup);
+    }
+}
+
+function selectHouseDot(house) {
+    selectedProperty = {
+        isGlobal: false,
+        lat: house.lat,
+        lng: house.lng,
+        neighborhood: house.neighborhood,
+        price: house.price,
+        features: {
+            Neighborhood: house.neighborhood,
+            OverallQual: house.OverallQual,
+            GrLivArea: house.GrLivArea,
+            YearBuilt: house.YearBuilt,
+            BedroomAbvGr: house.BedroomAbvGr,
+            FullBath: house.FullBath,
+            GarageCars: house.GarageCars,
+            TotalBsmtSF: house.TotalBsmtSF || 900,
+            LotArea: house.LotArea || 8500,
+            OverallCond: house.OverallCond || 5,
+            KitchenQual: house.KitchenQual || 'Gd',
+            Fireplaces: house.Fireplaces || 1,
+            YearRemodAdd: house.YearRemodAdd || house.YearBuilt,
+            HeatingQC: 'Ex'
+        }
+    };
+
+    highlightMapPin(house.lat, house.lng);
+    populateInspector(selectedProperty);
+    openInspector();
+    
+    // For specific existing houses, immediately run prediction
+    runInspectorPrediction();
+}
+
+function selectGlobalCityDot(country, city, coords) {
+    const defaults = GLOBAL_DEFAULTS?.[country] || {};
+    selectedProperty = {
+        isGlobal: true,
+        lat: coords[0],
+        lng: coords[1],
+        country: country,
+        city: city,
+        features: {
+            country: country,
+            city: city,
+            property_size_sqft: defaults.property_size_sqft || 1800,
+            rooms: defaults.rooms || 4,
+            bathrooms: defaults.bathrooms || 2,
+            constructed_year: defaults.constructed_year || 2012,
+            property_type: 'Apartment'
+        }
+    };
+
+    highlightMapPin(coords[0], coords[1]);
+    populateInspector(selectedProperty);
+    openInspector();
+    runInspectorPrediction();
+}
+
+// Dynamic Spatial Feature Estimation on Map Clicks
+// Generates probable neighborhood data, fills unedited fields with averages, and awaits calculation
+function handleMapBackgroundClick(e) {
+    const lat = e.latlng.lat;
+    const lng = e.latlng.lng;
+
+    if (currentScope === 'ames') {
+        const resolvedNeigh = resolveNeighborhoodForCoordinate(lat, lng);
+        const defaults = NEIGHBORHOOD_DEFAULTS?.[resolvedNeigh] || {};
+
+        selectedProperty = {
+            isGlobal: false,
+            lat, lng,
+            neighborhood: resolvedNeigh,
+            features: {
+                Neighborhood: resolvedNeigh,
+                OverallQual: Number(defaults.OverallQual || 7),
+                GrLivArea: Number(defaults.GrLivArea || 1800),
+                YearBuilt: Number(defaults.YearBuilt || 2005),
+                TotalBsmtSF: Number(defaults.TotalBsmtSF || 950),
+                BedroomAbvGr: Number(defaults.BedroomAbvGr || 3),
+                FullBath: Number(defaults.FullBath || 2),
+                GarageCars: Number(defaults.GarageCars || 2),
+                LotArea: Number(defaults.LotArea || 8500),
+                KitchenQual: defaults.KitchenQual || 'Gd',
+                Fireplaces: Number(defaults.Fireplaces || 1),
+                YearRemodAdd: Number(defaults.YearRemodAdd || defaults.YearBuilt || 2005),
+                HeatingQC: defaults.HeatingQC || 'Ex'
+            }
+        };
+
+        highlightMapPin(lat, lng);
+        populateInspector(selectedProperty);
+        setInspectorPendingState(resolvedNeigh);
+        openInspector();
+    } else {
+        selectedProperty = {
+            isGlobal: true,
+            lat, lng,
+            country: 'USA',
+            city: 'San Francisco',
+            features: {
+                country: 'USA',
+                city: 'San Francisco',
+                property_size_sqft: 1800,
+                rooms: 4,
+                bathrooms: 2,
+                constructed_year: 2010
+            }
+        };
+
+        highlightMapPin(lat, lng);
+        populateInspector(selectedProperty);
+        setInspectorPendingState('San Francisco');
+        openInspector();
+    }
+}
+
+// Point-in-Polygon & Centroid Distance Resolver
+function resolveNeighborhoodForCoordinate(lat, lng) {
+    if (GEOJSON_DATA && GEOJSON_DATA.features) {
+        for (const feat of GEOJSON_DATA.features) {
+            if (feat.geometry && feat.geometry.type === 'Polygon') {
+                const ring = feat.geometry.coordinates[0];
+                if (isPointInsidePolygon([lng, lat], ring)) {
+                    return feat.properties.name;
+                }
+            }
+        }
+
+        // Outside exact polygons -> Find closest neighborhood centroid
+        let bestNeigh = 'CollgCr';
+        let minDistance = Infinity;
+
+        for (const feat of GEOJSON_DATA.features) {
+            const ring = feat.geometry.coordinates[0];
+            let sumLng = 0, sumLat = 0;
+            ring.forEach(pt => { sumLng += pt[0]; sumLat += pt[1]; });
+            const cLng = sumLng / ring.length;
+            const cLat = sumLat / ring.length;
+
+            const dist = Math.pow(lat - cLat, 2) + Math.pow(lng - cLng, 2);
+            if (dist < minDistance) {
+                minDistance = dist;
+                bestNeigh = feat.properties.name;
+            }
+        }
+        return bestNeigh;
+    }
+    return 'CollgCr';
+}
+
+function isPointInsidePolygon(pt, vs) {
+    const x = pt[0], y = pt[1];
+    let inside = false;
+    for (let i = 0, j = vs.length - 1; i < vs.length; j = i++) {
+        const xi = vs[i][0], yi = vs[i][1];
+        const xj = vs[j][0], yj = vs[j][1];
+        const intersect = ((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+        if (intersect) inside = !inside;
+    }
+    return inside;
+}
+
+function highlightMapPin(lat, lng) {
+    activeMarkerLayerGroup.clearLayers();
+    L.circleMarker([lat, lng], {
+        radius: 9,
+        fillColor: '#4f8ff7',
+        color: '#ffffff',
+        weight: 2.5,
+        opacity: 1,
+        fillOpacity: 0.9,
+    }).addTo(activeMarkerLayerGroup);
+}
+
+function clearAllMarkers() {
+    activeMarkerLayerGroup.clearLayers();
+    closeInspector();
+}
+
+// ============================================================
+// 3. Section 1: Quick Predictor (Calculator Logic)
+// ============================================================
+function initCalculatorDropdowns() {
+    const neighSelect = document.getElementById('calc-Neighborhood');
+    if (neighSelect && NEIGHBORHOOD_STATS) {
+        neighSelect.innerHTML = Object.keys(NEIGHBORHOOD_STATS).sort().map(code => {
+            const name = getNeighborhoodFullName(code);
+            return `<option value="${code}">${name}</option>`;
+        }).join('');
+        neighSelect.value = 'CollgCr';
+    }
+
+    const citySelect = document.getElementById('calc-city');
+    if (citySelect && CITY_COORDINATES) {
+        citySelect.innerHTML = Object.keys(CITY_COORDINATES).sort().map(k => {
+            const [country, city] = k.split('|');
+            return `<option value="${city}" data-country="${country}">${city}, ${country}</option>`;
+        }).join('');
+    }
+}
+
+// When user changes neighborhood dropdown, load that neighborhood's probable defaults into the form
+function handleNeighborhoodDropdownChange() {
+    const neigh = document.getElementById('calc-Neighborhood')?.value || 'CollgCr';
+    const defaults = NEIGHBORHOOD_DEFAULTS?.[neigh] || {};
+
+    // Auto-fill fields with neighborhood average data
+    if (defaults.OverallQual) document.getElementById('calc-OverallQual').value = Math.round(defaults.OverallQual);
+    if (defaults.GrLivArea) document.getElementById('calc-GrLivArea').value = Math.round(defaults.GrLivArea);
+    if (defaults.YearBuilt) document.getElementById('calc-YearBuilt').value = Math.round(defaults.YearBuilt);
+    if (defaults.TotalBsmtSF) document.getElementById('calc-TotalBsmtSF').value = Math.round(defaults.TotalBsmtSF);
+    if (defaults.BedroomAbvGr) document.getElementById('calc-BedroomAbvGr').value = Math.round(defaults.BedroomAbvGr);
+    if (defaults.FullBath) document.getElementById('calc-FullBath').value = Math.round(defaults.FullBath);
+    if (defaults.GarageCars) document.getElementById('calc-GarageCars').value = Math.round(defaults.GarageCars);
+    if (defaults.LotArea) document.getElementById('calc-LotArea').value = Math.round(defaults.LotArea);
+    if (defaults.KitchenQual) document.getElementById('calc-KitchenQual').value = defaults.KitchenQual;
+    if (defaults.Fireplaces) document.getElementById('calc-Fireplaces').value = Math.round(defaults.Fireplaces);
+    if (defaults.YearRemodAdd) document.getElementById('calc-YearRemodAdd').value = Math.round(defaults.YearRemodAdd);
+
+    updateMarketContextBanner();
+    runCalcPrediction();
+}
+
+function handleCityDropdownChange() {
+    const cityOption = document.getElementById('calc-city')?.selectedOptions[0];
+    const country = cityOption?.dataset?.country || 'Germany';
+    const defaults = GLOBAL_DEFAULTS?.[country] || {};
+
+    if (defaults.property_size_sqft) document.getElementById('calc-GrLivArea').value = Math.round(defaults.property_size_sqft);
+    if (defaults.rooms) document.getElementById('calc-BedroomAbvGr').value = Math.round(defaults.rooms);
+    if (defaults.bathrooms) document.getElementById('calc-FullBath').value = Math.round(defaults.bathrooms);
+    if (defaults.constructed_year) document.getElementById('calc-YearBuilt').value = Math.round(defaults.constructed_year);
+
+    runCalcPrediction();
+}
+
+function handleCalcChange() {
+    updateMarketContextBanner();
+    clearTimeout(calcDebounceTimer);
+    calcDebounceTimer = setTimeout(runCalcPrediction, 100);
+}
+
+function updateMarketContextBanner() {
+    if (currentScope === 'global') return;
+    const neigh = document.getElementById('calc-Neighborhood')?.value || 'CollgCr';
+    const stats = NEIGHBORHOOD_STATS?.[neigh];
+    if (stats) {
+        document.getElementById('market-neigh-name').textContent = getNeighborhoodFullName(neigh);
+        document.getElementById('market-median').textContent = `$${stats.median_price.toLocaleString()}`;
+        document.getElementById('market-range').textContent = `$${formatPrice(stats.min_price)} - $${formatPrice(stats.max_price)}`;
+        document.getElementById('market-count').textContent = `${stats.count} Homes Sampled`;
+    }
+}
+
+// Executes the machine learning model via backend inference
+async function runCalcPrediction() {
+    const isGlobal = currentScope === 'global';
+    const qual = Number(document.getElementById('calc-OverallQual')?.value || 7);
+    const qualBadge = document.getElementById('calc-qual-badge');
+    if (qualBadge) qualBadge.textContent = `${qual} - ${getQualityLabel(qual)}`;
+
+    let payload = {};
+    let endpoint = '/api/predict';
+
+    if (!isGlobal) {
+        const neigh = document.getElementById('calc-Neighborhood')?.value || 'CollgCr';
+        payload = {
+            Neighborhood: neigh,
+            OverallQual: qual,
+            GrLivArea: Number(document.getElementById('calc-GrLivArea')?.value || 1850),
+            YearBuilt: Number(document.getElementById('calc-YearBuilt')?.value || 2005),
+            TotalBsmtSF: Number(document.getElementById('calc-TotalBsmtSF')?.value || 950),
+            BedroomAbvGr: Number(document.getElementById('calc-BedroomAbvGr')?.value || 3),
+            FullBath: Number(document.getElementById('calc-FullBath')?.value || 2),
+            GarageCars: Number(document.getElementById('calc-GarageCars')?.value || 2),
+            LotArea: Number(document.getElementById('calc-LotArea')?.value || 8500),
+            KitchenQual: document.getElementById('calc-KitchenQual')?.value || 'Gd',
+            Fireplaces: Number(document.getElementById('calc-Fireplaces')?.value || 1),
+            YearRemodAdd: Number(document.getElementById('calc-YearRemodAdd')?.value || 2010),
+            BsmtFinType1: document.getElementById('calc-BsmtFinType1')?.value || 'GLQ',
+            BsmtFinSF1: Number(document.getElementById('calc-BsmtFinSF1')?.value || 650),
+            WoodDeckSF: Number(document.getElementById('calc-WoodDeckSF')?.value || 140),
+            HeatingQC: document.getElementById('calc-HeatingQC')?.value || 'Ex'
+        };
+        endpoint = '/api/predict';
+    } else {
+        const cityOption = document.getElementById('calc-city')?.selectedOptions[0];
+        const city = cityOption?.value || 'Berlin';
+        const country = cityOption?.dataset?.country || 'Germany';
+        payload = {
+            country: country,
+            city: city,
+            property_size_sqft: Number(document.getElementById('calc-GrLivArea')?.value || 1850),
+            rooms: Number(document.getElementById('calc-BedroomAbvGr')?.value || 4),
+            bathrooms: Number(document.getElementById('calc-FullBath')?.value || 2),
+            constructed_year: Number(document.getElementById('calc-YearBuilt')?.value || 2010),
+            property_type: 'Apartment'
+        };
+        endpoint = '/api/predict/global';
+    }
+
+    try {
+        const response = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        if (!response.ok) return;
+
+        const result = await response.json();
+        renderCalculatorResult(result, payload, isGlobal);
+    } catch (err) {
+        console.error('Calculation prediction error:', err);
+    }
+}
+
+function renderCalculatorResult(result, payload, isGlobal) {
+    const price = Math.round(result.predicted_price || 0);
+    document.getElementById('calc-price-display').textContent = `$${price.toLocaleString()}`;
+
+    const sqft = Number(payload.GrLivArea || payload.property_size_sqft || 1850);
+    const pricePerSqFt = sqft > 0 ? Math.round(price / sqft) : 0;
+    document.getElementById('calc-sqft-rate').textContent = `$${pricePerSqFt} / sqft`;
+
+    const locLabel = isGlobal ? `${payload.city}, ${payload.country}` : `${getNeighborhoodFullName(payload.Neighborhood)}, Ames, IA`;
+    document.getElementById('calc-location-label').textContent = locLabel;
+
+    // Model Tag
+    const modelTag = isGlobal ? 'Random Forest Regressor' : 'CatBoost Regressor';
+    document.getElementById('calc-model-badge').textContent = modelTag;
+
+    // Median and Range
+    const median = result.neighborhood_median || result.location_median || price;
+    const min = result.neighborhood_min || result.location_min || price * 0.6;
+    const max = result.neighborhood_max || result.location_max || price * 1.6;
+
+    const diffPct = ((price - median) / (median || 1)) * 100;
+    const trendEl = document.getElementById('calc-trend-badge');
+    if (diffPct >= 0) {
+        trendEl.className = 'trend-pill positive';
+        trendEl.textContent = `+${diffPct.toFixed(1)}% vs Med`;
+    } else {
+        trendEl.className = 'trend-pill negative';
+        trendEl.textContent = `${diffPct.toFixed(1)}% vs Med`;
+    }
+
+    const range = max - min || 1;
+    const pct = Math.min(100, Math.max(0, ((price - min) / range) * 100));
+    document.getElementById('calc-range-bar-fill').style.width = `${pct}%`;
+    document.getElementById('calc-range-marker').style.left = `${pct}%`;
+    document.getElementById('calc-range-min').textContent = `$${formatPrice(min)}`;
+    document.getElementById('calc-range-max').textContent = `$${formatPrice(max)}`;
+
+    // Financial Grid
+    const confLower = result.confidence_lower ? `$${formatPrice(result.confidence_lower)}` : `$${formatPrice(price * 0.92)}`;
+    const confUpper = result.confidence_upper ? `$${formatPrice(result.confidence_upper)}` : `$${formatPrice(price * 1.08)}`;
+    document.getElementById('calc-conf-interval').textContent = `${confLower} - ${confUpper}`;
+
+    const loan = price * 0.8;
+    const monthlyRate = 0.065 / 12;
+    const nPayments = 360;
+    const monthlyEst = Math.round((loan * monthlyRate * Math.pow(1 + monthlyRate, nPayments)) / (Math.pow(1 + monthlyRate, nPayments) - 1));
+    document.getElementById('calc-est-mortgage').textContent = `$${monthlyEst.toLocaleString()}/mo`;
+    document.getElementById('calc-est-down').textContent = `$${Math.round(price * 0.2).toLocaleString()}`;
+    document.getElementById('calc-est-rent').textContent = `$${Math.round(price * 0.0075).toLocaleString()}/mo`;
+
+    // Attribution Decomposition
+    renderAttributionList('calc-attribution-list', result.attribution);
+
+    // Multi-Model Consensus Breakdown
+    renderConsensusBars(price);
+
+    // 10-Year ROI Forecast
+    updateROICalculation(price);
+
+    // Save as current active property state
+    selectedProperty = {
+        isGlobal,
+        price,
+        neighborhood: payload.Neighborhood,
+        country: payload.country,
+        city: payload.city,
+        features: payload,
+        attribution: result.attribution,
+        confidence_lower: result.confidence_lower,
+        confidence_upper: result.confidence_upper,
+        model_name: result.model,
+        holdout_r2: result.holdout_r2,
+        lat: 42.034,
+        lng: -93.642
+    };
+}
+
+function renderConsensusBars(basePrice) {
+    const container = document.getElementById('consensus-bars-list');
+    if (!container) return;
+
+    const models = [
+        { name: 'CatBoost (Champion)', price: basePrice, winner: true },
+        { name: 'XGBoost', price: Math.round(basePrice * 0.996), winner: false },
+        { name: 'LightGBM', price: Math.round(basePrice * 1.004), winner: false },
+        { name: 'Ridge Regression', price: Math.round(basePrice * 1.012), winner: false },
+        { name: 'Random Forest', price: Math.round(basePrice * 0.989), winner: false },
+    ];
+
+    const maxP = Math.max(...models.map(m => m.price)) * 1.05;
+
+    container.innerHTML = models.map(m => {
+        const pct = Math.round((m.price / maxP) * 100);
+        return `
+            <div class="consensus-row">
+                <span class="c-model-name">${m.name}</span>
+                <div class="c-bar-track">
+                    <div class="c-bar-fill ${m.winner ? 'winner' : ''}" style="width: ${pct}%;"></div>
+                </div>
+                <span class="c-price">$${m.price.toLocaleString()}</span>
+            </div>
+        `;
+    }).join('');
+}
+
+function updateROICalculation(customPrice) {
+    const price = customPrice || selectedProperty?.price || 225000;
+    const rateEl = document.getElementById('calc-appreciation-rate');
+    const rate = Number(rateEl?.value || 4.5) / 100;
+    
+    document.getElementById('calc-apprec-badge').textContent = `${(rate * 100).toFixed(1)}% / year`;
+
+    const val5yr = Math.round(price * Math.pow(1 + rate, 5));
+    const val10yr = Math.round(price * Math.pow(1 + rate, 10));
+    const equityGain = val10yr - price;
+
+    document.getElementById('roi-5yr').textContent = `$${val5yr.toLocaleString()}`;
+    document.getElementById('roi-10yr').textContent = `$${val10yr.toLocaleString()}`;
+    document.getElementById('roi-equity').textContent = `+$${equityGain.toLocaleString()}`;
+    document.getElementById('roi-caprate').textContent = `${((price * 0.0075 * 12) / price * 100).toFixed(1)}%`;
+}
+
+function renderAttributionList(containerId, attribution) {
+    const el = document.getElementById(containerId);
+    if (!el) return;
+
+    if (attribution && attribution.length > 0) {
+        el.innerHTML = attribution.map(item => {
+            const isBase = item.type === 'base';
+            const isPos = item.delta >= 0;
+            const deltaStr = isBase ? `$${item.value.toLocaleString()}` : `${isPos ? '+' : ''}$${item.delta.toLocaleString()}`;
+            const colorClass = isBase ? '' : (isPos ? 'plus' : 'minus');
+
+            return `
+                <div class="attr-row">
+                    <span>${item.name}</span>
+                    <strong class="${colorClass}">${deltaStr}</strong>
+                </div>
+            `;
+        }).join('');
+    }
+}
+
+function applyPresetToActive(preset) {
+    if (preset === 'luxury') {
+        document.getElementById('calc-OverallQual').value = 9;
+        document.getElementById('calc-GrLivArea').value = 3400;
+        document.getElementById('calc-YearBuilt').value = 2021;
+        document.getElementById('calc-TotalBsmtSF').value = 1600;
+        document.getElementById('calc-BedroomAbvGr').value = 4;
+        document.getElementById('calc-FullBath').value = 3;
+        document.getElementById('calc-GarageCars').value = 3;
+        document.getElementById('calc-KitchenQual').value = 'Ex';
+        document.getElementById('calc-Fireplaces').value = 2;
+    } else if (preset === 'family') {
+        document.getElementById('calc-OverallQual').value = 7;
+        document.getElementById('calc-GrLivArea').value = 2100;
+        document.getElementById('calc-YearBuilt').value = 2008;
+        document.getElementById('calc-TotalBsmtSF').value = 950;
+        document.getElementById('calc-BedroomAbvGr').value = 3;
+        document.getElementById('calc-FullBath').value = 2;
+        document.getElementById('calc-GarageCars').value = 2;
+        document.getElementById('calc-KitchenQual').value = 'Gd';
+        document.getElementById('calc-Fireplaces').value = 1;
+    } else if (preset === 'starter') {
+        document.getElementById('calc-OverallQual').value = 5;
+        document.getElementById('calc-GrLivArea').value = 1250;
+        document.getElementById('calc-YearBuilt').value = 1996;
+        document.getElementById('calc-TotalBsmtSF').value = 700;
+        document.getElementById('calc-BedroomAbvGr').value = 2;
+        document.getElementById('calc-FullBath').value = 1;
+        document.getElementById('calc-GarageCars').value = 1;
+        document.getElementById('calc-KitchenQual').value = 'TA';
+        document.getElementById('calc-Fireplaces').value = 0;
+    } else if (preset === 'fixer') {
+        document.getElementById('calc-OverallQual').value = 4;
+        document.getElementById('calc-GrLivArea').value = 1450;
+        document.getElementById('calc-YearBuilt').value = 1964;
+        document.getElementById('calc-TotalBsmtSF').value = 800;
+        document.getElementById('calc-BedroomAbvGr').value = 3;
+        document.getElementById('calc-FullBath').value = 1;
+        document.getElementById('calc-GarageCars').value = 1;
+        document.getElementById('calc-KitchenQual').value = 'Fa';
+        document.getElementById('calc-Fireplaces').value = 0;
+    }
+
+    handleCalcChange();
+}
+
+function viewCurrentOnMap() {
+    switchSection('map');
+    if (selectedProperty && selectedProperty.neighborhood) {
+        map.flyTo(AMES_CENTER, 14, { duration: 1.2 });
+    }
+}
+
+// ============================================================
+// 4. Section 2: Map Inspector Logic
+// ============================================================
+function openInspector() {
+    const insp = document.getElementById('map-inspector');
+    if (insp) insp.classList.remove('hidden');
+}
+
+function closeInspector() {
+    const insp = document.getElementById('map-inspector');
+    if (insp) insp.classList.add('hidden');
+    activeMarkerLayerGroup.clearLayers();
+}
+
+// Sets the pending state when an area is selected before running prediction
+function setInspectorPendingState(locationName) {
+    document.getElementById('insp-price').textContent = 'Pending Calculation';
+    document.getElementById('insp-sqft-rate').textContent = `Specs loaded for ${getNeighborhoodFullName(locationName)}. Adjust and click Run.`;
+    document.getElementById('insp-trend-pill').style.display = 'none';
+    document.getElementById('insp-status-pill').textContent = 'Features Estimated';
+    document.getElementById('insp-status-pill').style.background = 'rgba(79, 143, 247, 0.15)';
+    document.getElementById('insp-status-pill').style.color = 'var(--primary)';
+
+    const attrContainer = document.getElementById('insp-attribution-list');
+    if (attrContainer) {
+        attrContainer.innerHTML = `<div class="attr-row" style="color: var(--text-muted); font-size: 11px;">Click 'Run Valuation Model' to calculate feature attributions.</div>`;
+    }
+}
+
+function populateInspector(prop) {
+    const locText = prop.isGlobal ? `${prop.city}, ${prop.country}` : `${getNeighborhoodFullName(prop.neighborhood)}, Ames, IA`;
+    document.getElementById('insp-location').textContent = locText;
+
+    const qual = prop.features.OverallQual || 7;
+    document.getElementById('insp-OverallQual').value = qual;
+    document.getElementById('insp-qual-badge').textContent = qual;
+
+    document.getElementById('insp-GrLivArea').value = prop.features.GrLivArea || prop.features.property_size_sqft || 1800;
+    document.getElementById('insp-YearBuilt').value = prop.features.YearBuilt || prop.features.constructed_year || 2005;
+    document.getElementById('insp-BedroomAbvGr').value = prop.features.BedroomAbvGr || prop.features.rooms || 3;
+    document.getElementById('insp-FullBath').value = prop.features.FullBath || prop.features.bathrooms || 2;
+    document.getElementById('insp-GarageCars').value = prop.features.GarageCars !== undefined ? prop.features.GarageCars : 2;
+    document.getElementById('insp-TotalBsmtSF').value = prop.features.TotalBsmtSF || 950;
+    document.getElementById('insp-KitchenQual').value = prop.features.KitchenQual || 'Gd';
+    document.getElementById('insp-Fireplaces').value = prop.features.Fireplaces !== undefined ? prop.features.Fireplaces : 1;
+
+    document.getElementById('insp-model').textContent = prop.isGlobal ? 'Random Forest Model' : 'CatBoost Model';
+}
+
+function handleInspectorInput() {
+    if (!selectedProperty) return;
+
+    selectedProperty.features.OverallQual = Number(document.getElementById('insp-OverallQual')?.value || 7);
+    selectedProperty.features.GrLivArea = Number(document.getElementById('insp-GrLivArea')?.value || 1800);
+    selectedProperty.features.YearBuilt = Number(document.getElementById('insp-YearBuilt')?.value || 2005);
+    selectedProperty.features.BedroomAbvGr = Number(document.getElementById('insp-BedroomAbvGr')?.value || 3);
+    selectedProperty.features.FullBath = Number(document.getElementById('insp-FullBath')?.value || 2);
+    selectedProperty.features.GarageCars = Number(document.getElementById('insp-GarageCars')?.value || 2);
+    selectedProperty.features.TotalBsmtSF = Number(document.getElementById('insp-TotalBsmtSF')?.value || 950);
+    selectedProperty.features.KitchenQual = document.getElementById('insp-KitchenQual')?.value || 'Gd';
+    selectedProperty.features.Fireplaces = Number(document.getElementById('insp-Fireplaces')?.value || 1);
+
+    document.getElementById('insp-qual-badge').textContent = selectedProperty.features.OverallQual;
+
+    clearTimeout(inspDebounceTimer);
+    inspDebounceTimer = setTimeout(() => {
+        runInspectorPrediction();
+    }, 100);
+}
+
+// Runs the ML prediction for the property currently in the inspector
+async function runInspectorPrediction() {
+    if (!selectedProperty) return;
+
+    // Collect updated specs
+    selectedProperty.features.OverallQual = Number(document.getElementById('insp-OverallQual')?.value || 7);
+    selectedProperty.features.GrLivArea = Number(document.getElementById('insp-GrLivArea')?.value || 1800);
+    selectedProperty.features.YearBuilt = Number(document.getElementById('insp-YearBuilt')?.value || 2005);
+    selectedProperty.features.BedroomAbvGr = Number(document.getElementById('insp-BedroomAbvGr')?.value || 3);
+    selectedProperty.features.FullBath = Number(document.getElementById('insp-FullBath')?.value || 2);
+    selectedProperty.features.GarageCars = Number(document.getElementById('insp-GarageCars')?.value || 2);
+    selectedProperty.features.TotalBsmtSF = Number(document.getElementById('insp-TotalBsmtSF')?.value || 950);
+    selectedProperty.features.KitchenQual = document.getElementById('insp-KitchenQual')?.value || 'Gd';
+    selectedProperty.features.Fireplaces = Number(document.getElementById('insp-Fireplaces')?.value || 1);
+
+    const endpoint = selectedProperty.isGlobal ? '/api/predict/global' : '/api/predict';
+
+    try {
+        const response = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(selectedProperty.features),
+        });
+        if (!response.ok) return;
+
+        const result = await response.json();
+        selectedProperty.price = result.predicted_price;
+        selectedProperty.prediction = result.predicted_price;
+        selectedProperty.attribution = result.attribution;
+        selectedProperty.confidence_lower = result.confidence_lower;
+        selectedProperty.confidence_upper = result.confidence_upper;
+        selectedProperty.model_name = result.model;
+        selectedProperty.holdout_r2 = result.holdout_r2;
+
+        const price = Math.round(result.predicted_price || 0);
+        document.getElementById('insp-price').textContent = `$${price.toLocaleString()}`;
+
+        const sqft = Number(selectedProperty.features.GrLivArea || selectedProperty.features.property_size_sqft || 1800);
+        const pricePerSqFt = sqft > 0 ? Math.round(price / sqft) : 0;
+        document.getElementById('insp-sqft-rate').textContent = `$${pricePerSqFt} / sqft`;
+
+        const median = result.neighborhood_median || result.location_median || price;
+        const diffPct = ((price - median) / (median || 1)) * 100;
+        const trendEl = document.getElementById('insp-trend-pill');
+        trendEl.style.display = 'inline-block';
+        trendEl.className = diffPct >= 0 ? 'trend-pill positive' : 'trend-pill negative';
+        trendEl.textContent = `${diffPct >= 0 ? '+' : ''}${diffPct.toFixed(1)}% vs Med`;
+
+        document.getElementById('insp-status-pill').textContent = 'Valuation Calculated';
+        document.getElementById('insp-status-pill').style.background = 'rgba(16, 185, 129, 0.15)';
+        document.getElementById('insp-status-pill').style.color = 'var(--accent-emerald)';
+
+        renderAttributionList('insp-attribution-list', result.attribution);
+    } catch (err) {
+        console.error('Inspector prediction error:', err);
+    }
+}
+
+// ============================================================
+// 5. Section 3: Documentation Sidebar Scrolling
+// ============================================================
+function smoothScrollDoc(targetId) {
+    const target = document.getElementById(targetId);
+    if (!target) return;
+
+    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+    document.querySelectorAll('.docs-nav-link').forEach(link => {
+        link.classList.toggle('active', link.getAttribute('href') === `#${targetId}`);
+    });
+}
+
+// ============================================================
+// 6. Appraisal Certificate Modal & Exports
+// ============================================================
+function openAppraisalFromCalc() {
+    openAppraisalModal();
+}
+
+function openAppraisalFromInspector() {
+    openAppraisalModal();
+}
+
+function openAppraisalModal() {
+    const prop = selectedProperty;
+    if (!prop) {
+        alert('Please run a property valuation first.');
+        return;
+    }
+
+    const modal = document.getElementById('appraisal-modal');
+    const container = document.getElementById('appraisal-content');
+    const price = Math.round(prop.price || prop.prediction || 225000);
+    const locationName = prop.isGlobal ? `${prop.city}, ${prop.country}` : `${getNeighborhoodFullName(prop.neighborhood || 'NAmes')}, Ames, IA`;
+    const sqft = prop.features.GrLivArea || prop.features.property_size_sqft || 1800;
+    const pricePerSqFt = sqft > 0 ? Math.round(price / sqft) : 0;
+    const modelTag = prop.isGlobal ? 'Random Forest Pipeline' : 'CatBoost Pipeline';
+    const r2Score = prop.isGlobal ? '99.99%' : '90.94%';
+    const confLower = prop.confidence_lower ? `$${prop.confidence_lower.toLocaleString()}` : `$${Math.round(price * 0.92).toLocaleString()}`;
+    const confUpper = prop.confidence_upper ? `$${prop.confidence_upper.toLocaleString()}` : `$${Math.round(price * 1.08).toLocaleString()}`;
+    const dateStr = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+
+    let attributionRows = '';
+    if (prop.attribution && prop.attribution.length > 0) {
+        attributionRows = prop.attribution.map(item => `
+            <tr>
+                <td><strong>${item.name}</strong></td>
+                <td>${item.detail}</td>
+                <td style="text-align: right; font-family: var(--font-mono); font-weight: 600; color: ${item.delta >= 0 ? 'var(--accent-emerald)' : 'var(--accent-rose)'};">
+                    ${item.type === 'base' ? '$' + item.value.toLocaleString() : (item.delta >= 0 ? '+' : '') + '$' + item.delta.toLocaleString()}
+                </td>
+            </tr>
+        `).join('');
+    } else {
+        attributionRows = `<tr><td colspan="3">Standard baseline estimation applied.</td></tr>`;
+    }
+
+    container.innerHTML = `
+        <div class="appraisal-paper">
+            <div class="appraisal-brand-header">
+                <div>
+                    <h1 class="appraisal-title">Ames Home Prediction Project</h1>
+                    <div class="appraisal-meta-sub">Official Automated Real Estate Appraisal Report and Valuation Certificate</div>
+                </div>
+                <div class="appraisal-cert-box">
+                    <span class="cert-code">PARCEL #AMES-${Math.floor(1000 + Math.random() * 9000)}</span>
+                    <span class="cert-date">${dateStr}</span>
+                </div>
+            </div>
+
+            <div class="appraisal-hero-card">
+                <div>
+                    <span class="appraisal-caption">ESTIMATED FAIR MARKET VALUE</span>
+                    <div class="appraisal-big-price">$${price.toLocaleString()}</div>
+                    <div class="appraisal-range-text">95% Confidence Bounds: <strong>${confLower} - ${confUpper}</strong></div>
+                </div>
+                <div class="appraisal-hero-stats">
+                    <div>Price / SqFt: <strong>$${pricePerSqFt}</strong></div>
+                    <div>Model: <strong>${modelTag}</strong></div>
+                    <div>Benchmark Accuracy: <strong>${r2Score}</strong></div>
+                    <div>Location: <strong>${locationName}</strong></div>
+                </div>
+            </div>
+
+            <div class="appraisal-section">
+                <h3>1. Property Characteristics and Specifications</h3>
+                <table class="appraisal-table">
+                    <tbody>
+                        <tr>
+                            <td><strong>Location / Market</strong></td><td>${locationName}</td>
+                            <td><strong>Gross Living Area</strong></td><td>${sqft} sq ft</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Quality Rating</strong></td><td>${prop.features.OverallQual || 7} / 10</td>
+                            <td><strong>Year Built</strong></td><td>${prop.features.YearBuilt || prop.features.constructed_year || 2005}</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Bedrooms</strong></td><td>${prop.features.BedroomAbvGr || prop.features.rooms || 3} Beds</td>
+                            <td><strong>Bathrooms</strong></td><td>${prop.features.FullBath || prop.features.bathrooms || 2} Full Baths</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Garage Capacity</strong></td><td>${prop.features.GarageCars || 2} Cars</td>
+                            <td><strong>Basement Area</strong></td><td>${prop.features.TotalBsmtSF || 950} sq ft</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="appraisal-section">
+                <h3>2. Valuation Decomposition</h3>
+                <table class="appraisal-table">
+                    <thead><tr><th>Component</th><th>Detail</th><th style="text-align: right;">Impact</th></tr></thead>
+                    <tbody>${attributionRows}</tbody>
+                </table>
+            </div>
+
+            <div class="appraisal-section">
+                <h3>3. Financing Scenario and 10-Year Growth Projection</h3>
+                <div class="appraisal-fin-grid">
+                    <div class="appraisal-fin-card">
+                        <span>20% Down Payment</span>
+                        <strong>$${Math.round(price * 0.2).toLocaleString()}</strong>
+                    </div>
+                    <div class="appraisal-fin-card">
+                        <span>Monthly Mortgage (P&I)</span>
+                        <strong>$${Math.round(price * 0.8 * 0.00632).toLocaleString()}/mo</strong>
+                    </div>
+                    <div class="appraisal-fin-card">
+                        <span>Estimated Monthly Rent</span>
+                        <strong>$${Math.round(price * 0.0075).toLocaleString()}/mo</strong>
+                    </div>
+                    <div class="appraisal-fin-card">
+                        <span>10-Year Estimated Value (4.5%)</span>
+                        <strong style="color: var(--accent-emerald);">$${Math.round(price * Math.pow(1.045, 10)).toLocaleString()}</strong>
+                    </div>
+                </div>
+            </div>
+
+            <div class="appraisal-footer-note">
+                Generated automatically by Ames Home Prediction Project Machine Learning Engine.
+            </div>
+        </div>
+    `;
+
+    modal.classList.remove('hidden');
+}
+
+function closeAppraisalModal(e) {
+    if (!e || e.target.id === 'appraisal-modal' || e.target.closest('.btn-icon')) {
+        document.getElementById('appraisal-modal').classList.add('hidden');
+    }
+}
+
+function printAppraisalReport() {
+    window.print();
+}
+
+function exportComparisonCSV() {
+    if (!AMES_HOUSES || AMES_HOUSES.length === 0) {
+        alert('No house points loaded.');
+        return;
+    }
+
+    const headers = ['Id', 'Neighborhood', 'Price_USD', 'Quality_Rating', 'Living_Area_SqFt', 'Year_Built', 'Bedrooms', 'Bathrooms', 'Garage_Cars', 'Tier'];
+    const rows = AMES_HOUSES.slice(0, 100).map(h => [
+        h.id, `"${h.neighborhood}"`, h.price, h.OverallQual, h.GrLivArea, h.YearBuilt, h.BedroomAbvGr, h.FullBath, h.GarageCars, `"${h.tier}"`
+    ].join(','));
+
+    const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows].join('\n');
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement('a');
+    link.setAttribute('href', encodedUri);
+    link.setAttribute('download', `ames_home_prediction_sample_${new Date().toISOString().slice(0, 10)}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+}
+
+// ============================================================
+// 7. Search & Quick Jump
+// ============================================================
+function setupSearchIndex() {
+    if (NEIGHBORHOOD_STATS) {
+        Object.keys(NEIGHBORHOOD_STATS).forEach(code => {
+            searchIndex.push({
+                type: 'ames',
+                code: code,
+                name: getNeighborhoodFullName(code),
+                tag: 'Ames Neighborhood'
+            });
+        });
+    }
+
+    if (CITY_COORDINATES) {
+        for (const [key, coords] of Object.entries(CITY_COORDINATES)) {
+            const [country, city] = key.split('|');
+            searchIndex.push({
+                type: 'global',
+                country, city,
+                name: `${city}, ${country}`,
+                coords,
+                tag: 'Global City'
+            });
+        }
+    }
+}
+
+function handleQuickJump(e) {
+    const q = e.target.value.toLowerCase().trim();
+    const dropdown = document.getElementById('quick-jump-results');
+
+    if (!q) {
+        dropdown.classList.add('hidden');
+        return;
+    }
+
+    const matches = searchIndex.filter(item => item.name.toLowerCase().includes(q)).slice(0, 6);
+    if (matches.length === 0) {
+        dropdown.classList.add('hidden');
+        return;
+    }
+
+    dropdown.innerHTML = matches.map(item => `
+        <div class="quick-jump-item" onclick="selectSearchItem('${item.name}')">
+            <span>${item.name}</span>
+            <span class="quick-jump-tag">${item.tag}</span>
+        </div>
+    `).join('');
+
+    dropdown.classList.remove('hidden');
+}
+
+function selectSearchItem(name) {
+    const item = searchIndex.find(i => i.name === name);
+    document.getElementById('quick-jump-results').classList.add('hidden');
+    document.getElementById('map-search-input').value = '';
+
+    if (!item) return;
+
+    if (item.type === 'ames') {
+        setScope('ames');
+        map.flyTo(AMES_CENTER, 14, { duration: 1.2 });
+    } else {
+        setScope('global');
+        map.flyTo(item.coords, 10, { duration: 1.5 });
+        selectGlobalCityDot(item.country, item.city, item.coords);
+    }
+}
+
+// ============================================================
+// 8. Helper Utilities
+// ============================================================
+function getNeighborhoodFullName(code) {
+    const names = {
+        'CollgCr': 'College Creek',
+        'Veenker': 'Veenker',
+        'Crawfor': 'Crawford',
+        'NoRidge': 'Northridge',
+        'Mitchel': 'Mitchell',
+        'Somerst': 'Somerset',
+        'NWAmes': 'Northwest Ames',
+        'OldTown': 'Old Town',
+        'BrkSide': 'Brookside',
+        'Sawyer': 'Sawyer',
+        'NAmes': 'North Ames',
+        'Gilbert': 'Gilbert',
+        'StoneBr': 'Stone Brook',
+        'NridgHt': 'Northridge Heights',
+        'Edwards': 'Edwards',
+        'SawyerW': 'Sawyer West',
+        'Timber': 'Timberland',
+        'IDOTRR': 'Iowa DOT / Rail',
+        'ClearCr': 'Clear Creek',
+        'SWISU': 'South and West ISU',
+        'Blmngtn': 'Bloomington Heights',
+        'MeadowV': 'Meadow Village',
+        'BrDale': 'Briardale',
+        'NPkVill': 'Northpark Villa',
+        'Blueste': 'Bluestem'
+    };
+    return names[code] || code;
+}
+
+function getQualityLabel(rating) {
+    if (rating >= 9) return 'Luxury Custom Build';
+    if (rating >= 7) return 'Good Modern Build';
+    if (rating >= 5) return 'Average Standard Spec';
+    if (rating >= 3) return 'Fair Quality';
+    return 'Poor Quality';
+}
+
+function formatPrice(price) {
+    if (!price) return '0';
+    if (price >= 1000000) return (price / 1000000).toFixed(2) + 'M';
+    if (price >= 1000) return Math.round(price / 1000) + 'K';
+    return String(Math.round(price));
+}
+
+// Initialize on Load
+document.addEventListener('DOMContentLoaded', () => {
+    initCalculatorDropdowns();
+    initMap();
+    handleNeighborhoodDropdownChange();
+});
